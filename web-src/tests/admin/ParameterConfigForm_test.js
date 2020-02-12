@@ -2,7 +2,7 @@
 
 import {mount} from '@vue/test-utils';
 import {assert, config as chaiConfig} from 'chai';
-import ChipsList from '../../js/admin/components/ChipsList';
+import ChipsList from '../../js/components/ChipsList';
 import ParameterConfigForm from '../../js/admin/scripts-config/ParameterConfigForm';
 import {isBlankString, isNull, setInputValue} from '../../js/common';
 import Combobox from '../../js/components/combobox';
@@ -154,6 +154,7 @@ describe('Test ParameterConfigForm', function () {
                     description: 'my desc',
                     param: '-x',
                     type: 'int',
+                    env_var: 'My_Param',
                     no_value: true,
                     required: true,
                     constant: false,
@@ -171,6 +172,7 @@ describe('Test ParameterConfigForm', function () {
             assert.equal(true, _findField('required').value);
             assert.equal(false, _findField('constant').value);
             assert.equal(true, _findField('secret value').value);
+            assert.equal('My_Param', _findField('env variable').value);
         });
 
         it('Test simple parameters when int', async function () {
@@ -329,6 +331,12 @@ describe('Test ParameterConfigForm', function () {
             await _setValueByUser('Arg', '-p');
 
             assertOutputValue('param', '-p');
+        });
+
+        it('Test update env_var', async function () {
+            await _setValueByUser('Env variable', 'Param_X');
+
+            assertOutputValue('env_var', 'Param_X');
         });
 
         it('Test update type to int', async function () {

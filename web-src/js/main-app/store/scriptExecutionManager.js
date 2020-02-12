@@ -1,6 +1,7 @@
 import axios from 'axios';
-import {deepCloneObject, forEachKeyValue, isEmptyArray, isNull} from '../../common';
+import {deepCloneObject, forEachKeyValue, isEmptyArray, isEmptyString, isNull} from '../../common';
 import scriptExecutor, {STATUS_EXECUTING, STATUS_FINISHED, STATUS_INITIALIZING} from './scriptExecutor';
+import * as _ from 'lodash';
 
 export default {
     namespaced: true,
@@ -58,7 +59,8 @@ export default {
                                     commit('SELECT_EXECUTOR', executor);
                                     store.dispatch('scriptSetup/setParameterValues', {
                                         values: deepCloneObject(executionConfig.parameterValues),
-                                        forceAllowedValues: true
+                                        forceAllowedValues: true,
+                                        scriptName: executionConfig.scriptName
                                     });
                                 }
                             }));
@@ -95,7 +97,8 @@ export default {
             if (selectedExecutor) {
                 dispatch('scriptSetup/setParameterValues', {
                     values: selectedExecutor.state.parameterValues,
-                    forceAllowedValues: true
+                    forceAllowedValues: true,
+                    scriptName: selectedScript
                 }, {root: true});
             }
         },
@@ -138,7 +141,11 @@ export default {
 
                 })
                 .catch(error => {
-                    const {status, data} = error.response;
+                    const status = _.get(error, 'response.status');
+                    let data = _.get(error, 'response.data');
+                    if (isNull(error.response) || isEmptyString(data)) {
+                        data = 'Connection error. Please contact the system administrator';
+                    }
 
                     store.dispatch('executions/temp/setErrorStatus');
 

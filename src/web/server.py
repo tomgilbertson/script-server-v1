@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import asyncio
+import functools
 import json
 import logging.config
 import os
@@ -17,6 +19,7 @@ import tornado.httpserver as httpserver
 import tornado.ioloop
 import tornado.web
 import tornado.websocket
+from tornado import gen
 
 from auth.identification import AuthBasedIdentification, IpBasedIdentification
 from auth.tornado_auth import TornadoAuth
@@ -29,11 +32,11 @@ from features.file_download_feature import FileDownloadFeature
 from features.file_upload_feature import FileUploadFeature
 from model import external_model
 from model.external_model import to_short_execution_log, to_long_execution_log, parameter_to_external
-from model.model_helper import is_empty, InvalidFileException
+from model.model_helper import is_empty, InvalidFileException, AccessProhibitedException
 from model.parameter_config import WrongParameterUsageException
 from model.script_config import InvalidValueException, ParameterNotFoundException
 from model.server_conf import ServerConfig
-from utils import audit_utils, tornado_utils
+from utils import audit_utils, tornado_utils, os_utils, env_utils
 from utils import file_utils as file_utils
 from utils.audit_utils import get_audit_name_from_request
 from utils.tornado_utils import respond_error, redirect_relative
@@ -112,7 +115,14 @@ def check_authorization(func):
             return func(self, *args, **kwargs)
 
         if not isinstance(self, tornado.web.StaticFileHandler):
-            raise tornado.web.HTTPError(401, 'Not authenticated')
+            message = 'Not authenticated'
+            code = 401
+            LOGGER.warning('%s %s %s: user is not authenticated' % (code, self.request.method, request_path))
+            if isinstance(self, tornado.websocket.WebSocketHandler):
+                self.close(code=code, reason=message)
+                return
+            else:
+                raise tornado.web.HTTPError(code, message)
 
         login_url += "?" + urlencode(dict(next=request_path))
 
@@ -237,12 +247,21 @@ class ScriptConfigSocket(tornado.websocket.WebSocketHandler):
 
     @check_authorization
     @inject_user
+    @gen.coroutine
     def open(self, user, config_name):
         try:
-            self.config_model = self.application.config_service.load_config_model(config_name, user)
+            load_config_future = tornado.ioloop.IOLoop.current().run_in_executor(executor=None, func=functools.partial(
+                self.application.config_service.load_config_model, config_name, user))
+
+            self.config_model = yield load_config_future
             active_config_models[self.config_id] = {'model': self.config_model, 'user_id': user.user_id}
         except ConfigNotAllowedException:
             self.close(code=403, reason='Access to the script is denied')
+            return
+        except Exception:
+            message = 'Failed to load script config ' + config_name
+            LOGGER.exception(message)
+            self.close(code=500, reason=message)
             return
 
         if not self.config_model:
@@ -730,9 +749,9 @@ class ReceiveAlertHandler(BaseRequestHandler):
 
 class GetShortHistoryEntriesHandler(BaseRequestHandler):
     @check_authorization
-    @requires_admin_rights
-    def get(self):
-        history_entries = self.application.execution_logging_service.get_history_entries()
+    @inject_user
+    def get(self, user):
+        history_entries = self.application.execution_logging_service.get_history_entries(user.user_id)
         running_script_ids = []
         for entry in history_entries:
             if self.application.execution_service.is_running(entry.id):
@@ -744,13 +763,18 @@ class GetShortHistoryEntriesHandler(BaseRequestHandler):
 
 class GetLongHistoryEntryHandler(BaseRequestHandler):
     @check_authorization
-    @requires_admin_rights
-    def get(self, execution_id):
+    @inject_user
+    def get(self, user, execution_id):
         if is_empty(execution_id):
             respond_error(self, 400, 'Execution id is not specified')
             return
 
-        history_entry = self.application.execution_logging_service.find_history_entry(execution_id)
+        try:
+            history_entry = self.application.execution_logging_service.find_history_entry(execution_id, user.user_id)
+        except AccessProhibitedException:
+            respond_error(self, 403, 'Access to execution #' + str(execution_id) + ' is prohibited')
+            return
+
         if history_entry is None:
             respond_error(self, 400, 'No history found for id ' + execution_id)
             return
@@ -820,6 +844,9 @@ def intercept_stop_when_running_scripts(io_loop, execution_service):
     signal.signal(signal.SIGINT, signal_handler)
 
 
+_http_server = None
+
+
 def init(server_config: ServerConfig,
          authenticator,
          authorizer,
@@ -830,7 +857,9 @@ def init(server_config: ServerConfig,
          file_upload_feature: FileUploadFeature,
          file_download_feature: FileDownloadFeature,
          secret,
-         server_version):
+         server_version,
+         *,
+         start_server=True):
     ssl_context = None
     if server_config.is_ssl():
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -857,8 +886,8 @@ def init(server_config: ServerConfig,
                 (r'/executions/config/(.*)', GetExecutingScriptConfig),
                 (r'/executions/cleanup/(.*)', CleanupExecutingScript),
                 (r'/executions/status/(.*)', GetExecutionStatus),
-                (r'/admin/execution_log/short', GetShortHistoryEntriesHandler),
-                (r'/admin/execution_log/long/(.*)', GetLongHistoryEntryHandler),
+                (r'/history/execution_log/short', GetShortHistoryEntriesHandler),
+                (r'/history/execution_log/long/(.*)', GetLongHistoryEntryHandler),
                 (r'/auth/info', AuthInfoHandler),
                 (r'/result_files/(.*)',
                  DownloadResultFile,
@@ -898,13 +927,18 @@ def init(server_config: ServerConfig,
     application.identification = identification
     application.max_request_size_mb = server_config.max_request_size_mb
 
+    if os_utils.is_win() and env_utils.is_min_version('3.8'):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     io_loop = tornado.ioloop.IOLoop.current()
 
-    http_server = httpserver.HTTPServer(application, ssl_options=ssl_context, max_buffer_size=10 * BYTES_IN_MB)
-    http_server.listen(server_config.port, address=server_config.address)
+    global _http_server
+    _http_server = httpserver.HTTPServer(application, ssl_options=ssl_context, max_buffer_size=10 * BYTES_IN_MB)
+    _http_server.listen(server_config.port, address=server_config.address)
 
     intercept_stop_when_running_scripts(io_loop, execution_service)
 
     http_protocol = 'https' if server_config.ssl else 'http'
     print('Server is running on: %s://%s:%s' % (http_protocol, server_config.address, server_config.port))
-    io_loop.start()
+
+    if start_server:
+        io_loop.start()

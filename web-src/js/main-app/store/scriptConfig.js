@@ -4,8 +4,11 @@ import {
     arraysEqual,
     contains,
     forEachKeyValue,
+    HttpForbiddenError,
+    HttpRequestError,
     HttpUnauthorizedError,
     isEmptyArray,
+    isEmptyString,
     isNull,
     logError,
     removeElement,
@@ -30,6 +33,8 @@ function sendParameterValue(parameterName, value, websocket) {
     }));
 }
 
+export const NOT_FOUND_ERROR_PREFIX = `Failed to find the script`;
+
 export default {
     state: {
         scriptConfig: null,
@@ -43,7 +48,10 @@ export default {
         reloadScript({state, commit, dispatch}, {selectedScript}) {
             dispatch('setConnection', null);
             commit('RESET_CONFIG');
-            reconnect(state, internalState, commit, dispatch, selectedScript);
+
+            if (!isEmptyString(selectedScript)) {
+                reconnect(state, internalState, commit, dispatch, selectedScript);
+            }
         },
 
         sendParameterValue({state, commit}, {parameterName, value}) {
@@ -283,8 +291,18 @@ function reconnect(state, internalState, commit, dispatch, selectedScript) {
                 return;
             }
 
-            if (error instanceof HttpUnauthorizedError) {
+            if (error instanceof HttpForbiddenError) {
                 commit('SET_ERROR', 'Access to the script is denied');
+                return;
+            }
+
+            if (error instanceof HttpUnauthorizedError) {
+                commit('SET_ERROR', 'Failed to authenticate the user');
+                return;
+            }
+
+            if ((error instanceof HttpRequestError) && (error.code === 404)) {
+                commit('SET_ERROR', `${NOT_FOUND_ERROR_PREFIX} "${selectedScript}"`);
                 return;
             }
 
@@ -334,7 +352,9 @@ function loadFiles(scriptConfig, parameterName, path) {
         throw Error('Config is not available');
     }
 
-    const url = encodeURI('scripts/' + encodeURIComponent(scriptConfig.name) + '/' + parameterName + '/list-files');
+    const encodedScript = encodeURIComponent(scriptConfig.name);
+    const encodedParameter = encodeURIComponent(parameterName);
+    const url = `scripts/${encodedScript}/${encodedParameter}/list-files`;
     const param = $.param({'path': path, 'id': scriptConfig.id}, true);
     const full_url = url + '?' + param;
 
