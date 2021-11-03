@@ -6,9 +6,15 @@ import utils.file_utils as file_utils
 from auth.authorization import ANY_USER
 from model import model_helper
 from model.model_helper import read_list, read_int_from_config, read_bool_from_config
+from model.trusted_ips import TrustedIpValidator
 from utils.string_utils import strip
+import utils.custom_json as custom_json
 
 LOGGER = logging.getLogger('server_conf')
+
+XSRF_PROTECTION_TOKEN = 'token'
+XSRF_PROTECTION_HEADER = 'header'
+XSRF_PROTECTION_DISABLED = 'disabled'
 
 
 class ServerConfig(object):
@@ -25,13 +31,16 @@ class ServerConfig(object):
         self.admin_config = None
         self.title = None
         self.enable_script_titles = None
-        self.trusted_ips = []
+        self.ip_validator = TrustedIpValidator([])
         self.user_groups = None
         self.admin_users = []
         self.full_history_users = []
+        self.code_editor_users = []
         self.max_request_size_mb = None
         self.callbacks_config = None
         self.user_header_name = None
+        self.secret_storage_file = None
+        self.xsrf_protection = None
 
     def get_port(self):
         return self.port
@@ -60,7 +69,7 @@ def from_json(conf_path, temp_folder):
 
     config = ServerConfig()
 
-    json_object = json.loads(file_content)
+    json_object = custom_json.loads(file_content)
 
     address = "0.0.0.0"
     port = 5000
@@ -112,13 +121,17 @@ def from_json(conf_path, temp_folder):
         def_admins = def_trusted_ips
 
     if access_config:
-        config.trusted_ips = strip(read_list(access_config, 'trusted_ips', default=def_trusted_ips))
+        trusted_ips = strip(read_list(access_config, 'trusted_ips', default=def_trusted_ips))
         admin_users = _parse_admin_users(access_config, default_admins=def_admins)
         full_history_users = _parse_history_users(access_config)
+        code_editor_users = _parse_code_editor_users(access_config, admin_users)
     else:
-        config.trusted_ips = def_trusted_ips
+        trusted_ips = def_trusted_ips
         admin_users = def_admins
         full_history_users = []
+        code_editor_users = def_admins
+
+    security = model_helper.read_dict(json_object, 'security')
 
     config.allowed_users = _prepare_allowed_users(allowed_users, admin_users, user_groups)
     config.alerts_config = json_object.get('alerts')
@@ -127,9 +140,14 @@ def from_json(conf_path, temp_folder):
     config.user_groups = user_groups
     config.admin_users = admin_users
     config.full_history_users = full_history_users
+    config.code_editor_users = code_editor_users
     config.user_header_name = user_header_name
+    config.ip_validator = TrustedIpValidator(trusted_ips)
 
     config.max_request_size_mb = read_int_from_config('max_request_size', json_object, default=10)
+
+    config.secret_storage_file = json_object.get('secret_storage_file', os.path.join(temp_folder, 'secret.dat'))
+    config.xsrf_protection = _parse_xsrf_protection(security)
 
     return config
 
@@ -147,8 +165,16 @@ def create_authenticator(auth_object, temp_folder):
     elif auth_type == 'google_oauth':
         from auth.auth_google_oauth import GoogleOauthAuthenticator
         authenticator = GoogleOauthAuthenticator(auth_object)
+    elif auth_type == 'gitlab':
+        from auth.auth_gitlab import GitlabOAuthAuthenticator
+        authenticator = GitlabOAuthAuthenticator(auth_object)
+    elif auth_type == 'htpasswd':
+        from auth.auth_htpasswd import HtpasswdAuthenticator
+        authenticator = HtpasswdAuthenticator(auth_object)
     else:
         raise Exception(auth_type + ' auth is not supported')
+
+    authenticator.auth_expiration_days = float(auth_object.get('expiration_days', 30))
 
     authenticator.auth_type = auth_type
 
@@ -206,3 +232,26 @@ def _parse_history_users(json_object):
         return [ANY_USER]
 
     return full_history_users
+
+
+def _parse_code_editor_users(json_object, admin_users):
+    full_code_editor_users = strip(read_list(json_object, 'code_editors', default=admin_users))
+    if (isinstance(full_code_editor_users, list) and '*' in full_code_editor_users) \
+            or full_code_editor_users == '*':
+        return [ANY_USER]
+
+    return full_code_editor_users
+
+
+def _parse_xsrf_protection(security):
+    return model_helper.read_str_from_config(security,
+                                             'xsrf_protection',
+                                             default=XSRF_PROTECTION_TOKEN,
+                                             allowed_values=[XSRF_PROTECTION_TOKEN,
+                                                             XSRF_PROTECTION_HEADER,
+                                                             XSRF_PROTECTION_DISABLED])
+
+
+class InvalidServerConfigException(Exception):
+    def __init__(self, message) -> None:
+        super().__init__(message)

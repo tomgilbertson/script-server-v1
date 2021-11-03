@@ -6,9 +6,11 @@ from shutil import copyfile
 import utils.file_utils as file_utils
 import utils.os_utils as os_utils
 import utils.string_utils as string_utils
+from auth.user import User
 from execution.execution_service import ExecutionService
-from model.model_helper import is_empty, fill_parameter_values
+from model.model_helper import is_empty, fill_parameter_values, replace_auth_vars
 from react.observable import read_until_closed
+from utils import audit_utils
 from utils.file_utils import create_unique_filename
 
 INLINE_IMAGE_TYPE = 'inline-image'
@@ -27,8 +29,8 @@ class FileDownloadFeature:
         self._execution_handlers = {}
 
     def subscribe(self, execution_service: ExecutionService):
-        def start_listener(execution_id):
-            handler = _ScriptHandler(execution_id, execution_service, self.result_folder, self.user_file_storage)
+        def start_listener(execution_id, user):
+            handler = _ScriptHandler(execution_id, user, execution_service, self.result_folder, self.user_file_storage)
             self._execution_handlers[execution_id] = handler
 
         execution_service.add_start_listener(start_listener)
@@ -57,11 +59,12 @@ class FileDownloadFeature:
 
 class _ScriptHandler:
 
-    def __init__(self, execution_id, execution_service: ExecutionService, result_folder, file_storage) -> None:
+    def __init__(self, execution_id, user: User, execution_service: ExecutionService, result_folder,
+                 file_storage) -> None:
         self.execution_id = execution_id
         self.execution_service = execution_service
 
-        self.config = self.execution_service.get_config(execution_id)
+        self.config = self.execution_service.get_config(execution_id, user)
 
         self.result_files_paths = self._get_paths(execution_id, self._is_post_finish_path)
         self.inline_image_paths = self._get_paths(execution_id, self._is_inline_image_path)
@@ -98,11 +101,18 @@ class _ScriptHandler:
         paths = [_extract_path(f) for f in config.output_files if predicate(f)]
         paths = [p for p in paths if p]
 
-        parameter_values = self.execution_service.get_user_parameter_values(execution_id)
-        return substitute_parameter_values(
+        parameter_values = self.execution_service.get_script_parameter_values(execution_id)
+        all_audit_names = self.execution_service.get_all_audit_names(execution_id)
+
+        audit_name = audit_utils.get_audit_name(all_audit_names)
+        username = audit_utils.get_audit_username(all_audit_names)
+
+        return substitute_variable_values(
             config.parameters,
             paths,
-            parameter_values)
+            parameter_values,
+            audit_name,
+            username)
 
     @staticmethod
     def _is_post_finish_path(file):
@@ -228,10 +238,11 @@ class _ScriptHandler:
                 LOGGER.error('Failed to notify image listener')
 
 
-def substitute_parameter_values(parameter_configs, output_files, values):
+def substitute_variable_values(parameter_configs, output_files, values, audit_name, username):
     output_file_parsed = []
     for _, output_file in enumerate(output_files):
         substituted_file = fill_parameter_values(parameter_configs, output_file, values)
+        substituted_file = replace_auth_vars(substituted_file, username, audit_name)
         output_file_parsed.append(substituted_file)
 
     return output_file_parsed

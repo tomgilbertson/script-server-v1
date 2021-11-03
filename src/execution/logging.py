@@ -4,6 +4,7 @@ import os
 import re
 from string import Template
 
+from auth.authorization import is_same_user
 from execution.execution_service import ExecutionService
 from model.model_helper import AccessProhibitedException
 from utils import file_utils, audit_utils
@@ -100,6 +101,7 @@ class HistoryEntry:
         self.start_time = None
         self.script_name = None
         self.command = None
+        self.output_format = None
         self.id = None
         self.exit_code = None
 
@@ -125,6 +127,7 @@ class ExecutionLoggingService:
                       command,
                       output_stream,
                       all_audit_names,
+                      output_format,
                       start_time_millis=None):
 
         if start_time_millis is None:
@@ -142,6 +145,7 @@ class ExecutionLoggingService:
         output_logger.write_line('script:' + script_name)
         output_logger.write_line('start_time:' + str(start_time_millis))
         output_logger.write_line('command:' + command)
+        output_logger.write_line('output_format:' + output_format)
         output_logger.write_line(OUTPUT_STARTED_MARKER)
         output_logger.start()
 
@@ -190,8 +194,8 @@ class ExecutionLoggingService:
             LOGGER.warning('find_history_entry: cannot parse file for %s', execution_id)
 
         elif not self._can_access_entry(entry, user_id):
-            message = 'User ' + user_id + ' has not access to execution #' + str(execution_id)
-            LOGGER.warning('%s. Original user: %s', message, execution_id)
+            message = 'User ' + user_id + ' has no access to execution #' + str(execution_id)
+            LOGGER.warning('%s. Original user: %s', message, entry.user_id)
             raise AccessProhibitedException(message)
 
         return entry
@@ -302,6 +306,7 @@ class ExecutionLoggingService:
         entry.user_name = parameters.get('user_name')
         entry.user_id = parameters.get('user_id')
         entry.command = parameters.get('command')
+        entry.output_format = parameters.get('output_format')
 
         exit_code = parameters.get('exit_code')
         if exit_code is not None:
@@ -328,7 +333,7 @@ class ExecutionLoggingService:
         if entry is None:
             return True
 
-        if entry.user_id == user_id:
+        if is_same_user(entry.user_id, user_id):
             return True
 
         if system_call:
@@ -350,7 +355,7 @@ class LogNameCreator:
 
         date_string = ms_to_datetime(start_time).strftime(self._date_format)
 
-        username = get_first_existing(all_audit_names, audit_utils.AUTH_USERNAME, audit_utils.PROXIED_USERNAME)
+        username = audit_utils.get_audit_username(all_audit_names)
 
         mapping = {
             'ID': execution_id,
@@ -367,7 +372,7 @@ class LogNameCreator:
         if not filename.lower().endswith('.log'):
             filename += '.log'
 
-        filename = filename.replace(" ", "_")
+        filename = filename.replace(" ", "_").replace("/", "_")
 
         return filename
 
@@ -381,12 +386,12 @@ class ExecutionLoggingController:
         execution_service = self._execution_service
         logging_service = self._execution_logging_service
 
-        def started(execution_id):
-            script_config = execution_service.get_config(execution_id)
+        def started(execution_id, user):
+            script_config = execution_service.get_config(execution_id, user)
             script_name = str(script_config.name)
-            audit_name = execution_service.get_audit_name(execution_id)
-            owner = execution_service.get_owner(execution_id)
-            all_audit_names = execution_service.get_all_audit_names(execution_id)
+            audit_name = user.get_audit_name()
+            owner = user.user_id
+            all_audit_names = user.audit_names
             output_stream = execution_service.get_anonymized_output_stream(execution_id)
             audit_command = execution_service.get_audit_command(execution_id)
 
@@ -397,9 +402,10 @@ class ExecutionLoggingController:
                 script_name,
                 audit_command,
                 output_stream,
-                all_audit_names)
+                all_audit_names,
+                script_config.output_format)
 
-        def finished(execution_id):
+        def finished(execution_id, user):
             exit_code = execution_service.get_exit_code(execution_id)
             logging_service.write_post_execution_info(execution_id, exit_code)
 

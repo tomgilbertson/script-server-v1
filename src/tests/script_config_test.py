@@ -2,13 +2,16 @@ import os
 import unittest
 from collections import OrderedDict
 
+from parameterized import parameterized
+
 from config.constants import PARAM_TYPE_SERVER_FILE, PARAM_TYPE_MULTISELECT
+from config.exceptions import InvalidConfigException
 from model.script_config import ConfigModel, InvalidValueException, _TemplateProperty, ParameterNotFoundException, \
     get_sorted_config
 from react.properties import ObservableDict, ObservableList
 from tests import test_utils
 from tests.test_utils import create_script_param_config, create_parameter_model, create_files
-from utils import file_utils
+from utils import file_utils, custom_json
 
 DEF_AUDIT_NAME = '127.0.0.1'
 DEF_USERNAME = 'user1'
@@ -25,7 +28,7 @@ class ConfigModelInitTest(unittest.TestCase):
         description = 'A script for test_create_full_config'
         working_directory = '/root'
         requires_terminal = False
-        bash_formatting = True
+        output_format = 'terminal'
         output_files = ['file1', 'file2']
 
         config_model = _create_config_model(name, config={
@@ -33,16 +36,18 @@ class ConfigModelInitTest(unittest.TestCase):
             'description': description,
             'working_directory': working_directory,
             'requires_terminal': requires_terminal,
-            'bash_formatting': bash_formatting,
-            'output_files': output_files})
+            'output_format': output_format,
+            'output_files': output_files,
+            'scheduling': {'enabled': True}})
 
         self.assertEqual(name, config_model.name)
         self.assertEqual(script_path, config_model.script_command)
         self.assertEqual(description, config_model.description)
         self.assertEqual(working_directory, config_model.working_directory)
         self.assertEqual(requires_terminal, config_model.requires_terminal)
-        self.assertEqual(bash_formatting, config_model.ansi_enabled)
+        self.assertEqual(output_format, config_model.output_format)
         self.assertEqual(output_files, config_model.output_files)
+        self.assertTrue(config_model.schedulable)
 
     def test_create_with_parameter(self):
         config_model = _create_config_model('conf_p_1', parameters=[create_script_param_config('param1')])
@@ -90,6 +95,27 @@ class ConfigModelInitTest(unittest.TestCase):
                       create_script_param_config('p2', no_value=True)]
         self.assertRaisesRegex(Exception, 'Unsupported parameter "p2"',
                                _create_config_model, 'conf', parameters=parameters)
+
+    @parameterized.expand([
+        ('html', 'html'),
+        ('terminal', 'terminal'),
+        ('', 'terminal'),
+        ('HTML_iframe', 'html_iframe'),
+        (' Text  ', 'text'),
+    ])
+    def test_create_with_output_format(self, output_format, expected_output_format):
+        name = 'conf_y'
+
+        config_model = _create_config_model(name, config={
+            'output_format': output_format})
+
+        self.assertEqual(expected_output_format, config_model.output_format)
+
+    def test_create_with_wrong_output_format(self):
+        name = 'conf_y'
+
+        self.assertRaisesRegex(InvalidConfigException, 'Invalid output format', _create_config_model, name, config={
+            'output_format': 'abc'})
 
 
 class ConfigModelValuesTest(unittest.TestCase):
@@ -289,7 +315,7 @@ class ParameterModelDependantValuesTest(unittest.TestCase):
 class ConfigModelIncludeTest(unittest.TestCase):
     def test_static_include_simple(self):
         included_path = test_utils.write_script_config({'script_path': 'ping google.com'}, 'included')
-        config_model = _create_config_model('main_conf', config={'include': included_path})
+        config_model = _create_config_model('main_conf', script_path=None, config={'include': included_path})
 
         self.assertEqual('ping google.com', config_model.script_command)
 
@@ -336,7 +362,7 @@ class ConfigModelIncludeTest(unittest.TestCase):
             'script_path': 'ping google.com',
             'hidden': True},
             'included')
-        config_model = _create_config_model('main_conf', config={'include': included_path})
+        config_model = _create_config_model('main_conf', script_path=None, config={'include': included_path})
 
         self.assertEqual('ping google.com', config_model.script_command)
 
@@ -539,6 +565,29 @@ class TestParametersValidation(unittest.TestCase):
         valid = self._validate(script_config, values)
         self.assertFalse(valid)
 
+    def test_multiple_required_parameters_when_one_missing_and_skip_invalid(self):
+        values = {}
+        parameters = []
+        for i in range(0, 5):
+            param_name = 'param' + str(i)
+            parameter = create_script_param_config(param_name, required=True)
+            parameters.append(parameter)
+
+            if i != 3:
+                values[param_name] = str(i)
+
+        script_config = _create_config_model('conf_x', parameters=parameters, skip_invalid_parameters=True)
+
+        valid = self._validate(script_config, values, skip_invalid_parameters=True)
+        self.assertTrue(valid)
+        self.assertEqual({
+            'param0': '0',
+            'param1': '1',
+            'param2': '2',
+            'param3': None,
+            'param4': '4'},
+            script_config.parameter_values)
+
     def test_multiple_parameters_when_all_defined(self):
         values = {}
         parameters = []
@@ -603,9 +652,9 @@ class TestParametersValidation(unittest.TestCase):
         test_utils.cleanup()
 
     @staticmethod
-    def _validate(script_config, parameter_values):
+    def _validate(script_config, parameter_values, skip_invalid_parameters=False):
         try:
-            script_config.set_all_param_values(parameter_values)
+            script_config.set_all_param_values(parameter_values, skip_invalid_parameters=skip_invalid_parameters)
             return True
 
         except InvalidValueException:
@@ -805,6 +854,69 @@ class GetSortedConfigTest(unittest.TestCase):
         self.assertEqual(expected, config)
 
 
+    def test_json_comments(self):
+        config = get_sorted_config(custom_json.loads(
+                """{
+                // Comment 1
+                "parameters": [
+                            // Comment 2
+                            {"name": "param2", "description": "desc 1"},
+                            {"type": "int", "name": "paramA"},
+                            {"default": "false", "name": "param1", "no_value": true}
+                            ],
+                // Comment 3
+                "name": "Conf X"
+                }""")
+            )
+
+        expected = OrderedDict([
+            ('name', 'Conf X'),
+            ('parameters', [
+                OrderedDict([('name', 'param2'), ('description', 'desc 1')]),
+                OrderedDict([('name', 'paramA'), ('type', 'int')]),
+                OrderedDict([('name', 'param1'), ('no_value', True), ('default', 'false')])
+            ]),
+        ])
+        self.assertEqual(expected, config)
+
+
+class SchedulableConfigTest(unittest.TestCase):
+    def test_create_with_schedulable_false(self):
+        config_model = _create_config_model('some-name', config={
+            'scheduling': {'enabled': False}})
+        self.assertFalse(config_model.schedulable)
+
+    def test_create_with_schedulable_default(self):
+        config_model = _create_config_model('some-name', config={})
+        self.assertFalse(config_model.schedulable)
+
+    def test_create_with_schedulable_true_and_secure_parameter(self):
+        config_model = _create_config_model('some-name', config={
+            'scheduling': {'enabled': True},
+            'parameters': [{'name': 'p1', 'secure': True}]
+        })
+        self.assertFalse(config_model.schedulable)
+
+    def test_create_with_schedulable_true_and_included_secure_parameter(self):
+        config_model = _create_config_model('some-name', config={
+            'scheduling': {'enabled': True},
+            'include': '${p1}',
+            'parameters': [{'name': 'p1', 'secure': False}]
+        })
+        another_path = test_utils.write_script_config(
+            {'parameters': [{'name': 'p2', 'secure': True}]},
+            'another_config')
+
+        self.assertTrue(config_model.schedulable)
+
+        config_model.set_param_value('p1', another_path)
+
+        self.assertFalse(config_model.schedulable)
+
+    def tearDown(self) -> None:
+        test_utils.cleanup()
+
+
 def _create_config_model(name, *,
                          config=None,
                          username=DEF_USERNAME,
@@ -812,8 +924,13 @@ def _create_config_model(name, *,
                          path=None,
                          parameters=None,
                          parameter_values=None,
-                         working_dir=None):
+                         working_dir=None,
+                         script_path='echo 123',
+                         skip_invalid_parameters=False):
     result_config = {}
+
+    if script_path is not None:
+        result_config['script_path'] = script_path
 
     if config:
         result_config.update(config)
@@ -829,4 +946,8 @@ def _create_config_model(name, *,
     if working_dir is not None:
         result_config['working_directory'] = working_dir
 
-    return ConfigModel(result_config, path, username, audit_name, parameter_values=parameter_values)
+    model = ConfigModel(result_config, path, username, audit_name)
+    if parameter_values is not None:
+        model.set_all_param_values(parameter_values, skip_invalid_parameters=skip_invalid_parameters)
+
+    return model

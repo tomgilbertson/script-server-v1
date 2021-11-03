@@ -15,7 +15,7 @@ VERSION_FILE = 'version.txt'
 BUILD_FOLDER = 'build'
 
 
-class BuildInfo():
+class BuildInfo:
     def __init__(self):
         self.files = set()
 
@@ -89,7 +89,7 @@ if os.path.exists(BUILD_FOLDER):
     shutil.rmtree(BUILD_FOLDER)
 os.mkdir(BUILD_FOLDER)
 
-init.prepare_project('', prod=True)
+init.prepare_project('')
 create_version_file()
 
 build_info = BuildInfo()
@@ -101,6 +101,7 @@ build_info.include(os.path.join('conf', 'logging.json'))
 build_info.include(os.path.join('web', '**'))
 build_info.include(os.path.join('conf', 'runners'))
 build_info.exclude(os.path.join('src', 'tests'))
+build_info.exclude(os.path.join('src', 'e2e_tests'))
 build_info.exclude('tools')
 build_info.exclude('samples')
 build_info.exclude(BUILD_FOLDER)

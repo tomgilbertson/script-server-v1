@@ -10,8 +10,8 @@ from utils import string_utils
 LOGGER = logging.getLogger('script_server.process_utils')
 
 
-def invoke(command, work_dir='.', *, environment_variables=None):
-    if isinstance(command, str):
+def invoke(command, work_dir='.', *, environment_variables=None, check_stderr=True, shell=False):
+    if isinstance(command, str) and not shell:
         command = split_command(command, working_directory=work_dir)
 
     if environment_variables is not None:
@@ -24,7 +24,8 @@ def invoke(command, work_dir='.', *, environment_variables=None):
                          stderr=subprocess.PIPE,
                          cwd=work_dir,
                          env=env,
-                         universal_newlines=True)
+                         universal_newlines=True,
+                         shell=shell)
 
     (output, error) = p.communicate()
 
@@ -32,8 +33,8 @@ def invoke(command, work_dir='.', *, environment_variables=None):
     if result_code != 0:
         raise ExecutionException(result_code, error, output)
 
-    if error:
-        print("WARN! Error output wasn't empty, although the command finished with code 0!")
+    if error and check_stderr:
+        LOGGER.warning("Error output wasn't empty, although the command finished with code 0!")
 
     return output
 
@@ -90,6 +91,6 @@ class ExecutionException(Exception):
 
         super().__init__(message)
 
-        self._stdout = stdout
-        self._stderr = stderr
-        self._exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code

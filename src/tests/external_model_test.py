@@ -3,7 +3,9 @@ import unittest
 from datetime import datetime, timezone
 
 from execution.logging import HistoryEntry
-from model.external_model import to_short_execution_log, to_long_execution_log, server_conf_to_external
+from model.external_model import to_short_execution_log, to_long_execution_log, server_conf_to_external, \
+    parse_external_schedule
+from model.script_config import OUTPUT_FORMAT_TERMINAL
 from model.server_conf import ServerConfig
 
 
@@ -80,7 +82,7 @@ class TestHistoryEntry(unittest.TestCase):
         self._validate_translated_entry(translated_entries[2], 'id3', exit_code='13')
 
     def test_long_history_entry(self):
-        entry = self._create_history_entry('id1', command='ping localhost')
+        entry = self._create_history_entry('id1', command='ping localhost', output_format='html')
         long_entry = to_long_execution_log(entry, 'log text\nend', True)
 
         self._validate_translated_entry(
@@ -97,7 +99,8 @@ class TestHistoryEntry(unittest.TestCase):
                               script_name='my_script',
                               command='cmd',
                               start_time=None,
-                              exit_code='0'):
+                              exit_code='0',
+                              output_format=OUTPUT_FORMAT_TERMINAL):
         if id is None:
             id = str(self.random_instance.randint(0, 10000000))
 
@@ -115,6 +118,7 @@ class TestHistoryEntry(unittest.TestCase):
         entry.script_name = script_name
         entry.command = command
         entry.exit_code = exit_code
+        entry.output_format = output_format
 
         return entry
 
@@ -127,7 +131,8 @@ class TestHistoryEntry(unittest.TestCase):
                                    command=None,
                                    start_time_string=None,
                                    exit_code='0',
-                                   log=None):
+                                   log=None,
+                                   output_format=None):
         self.assertEqual(entry.get('id'), id)
         self.assertEqual(entry.get('user'), user)
         self.assertEqual(entry.get('script'), script_name)
@@ -135,6 +140,7 @@ class TestHistoryEntry(unittest.TestCase):
         self.assertEqual(entry.get('command'), command)
         self.assertEqual(entry.get('exitCode'), exit_code)
         self.assertEqual(entry.get('log'), log)
+        self.assertEqual(entry.get('output_format'), output_format)
 
         if start_time_string is not None:
             self.assertEqual(entry.get('startTime'), start_time_string)
@@ -163,3 +169,43 @@ class TestServerConf(unittest.TestCase):
         self.assertIsNone(external_config.get('title'))
         self.assertIsNone(external_config.get('enableScriptTitles'))
         self.assertIsNone(external_config.get('version'))
+
+
+class TestParseExternalSchedule(unittest.TestCase):
+    def test_parse_full_config(self):
+        parsed = parse_external_schedule(
+            {'repeatable': False, 'startDatetime': '2020-12-30', 'repeatUnit': 'days', 'repeatPeriod': 5,
+             'weekDays': ['monday', 'Tuesday']})
+
+        self.assertDictEqual({
+            'repeatable': False,
+            'start_datetime': '2020-12-30',
+            'repeat_unit': 'days',
+            'repeat_period': 5,
+            'weekdays': ['monday', 'Tuesday']},
+            parsed)
+
+    def test_parse_partial_config(self):
+        parsed = parse_external_schedule(
+            {'repeatable': False, 'startDatetime': '2020-12-30'})
+
+        self.assertDictEqual({
+            'repeatable': False,
+            'start_datetime': '2020-12-30',
+            'repeat_unit': None,
+            'repeat_period': None,
+            'weekdays': None},
+            parsed)
+
+    def test_parse_unknown_field(self):
+        parsed = parse_external_schedule(
+            {'repeatable': False,
+             'startDatetime': '2020-12-30',
+             'anotherField': 'abc'})
+
+        self.assertDictEqual({
+            'repeatable': False,
+            'start_datetime': '2020-12-30',
+            'repeat_unit': None,
+            'repeat_period': None,
+            'weekdays': None}, parsed)

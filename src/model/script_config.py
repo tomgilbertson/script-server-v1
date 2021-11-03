@@ -5,12 +5,18 @@ import re
 from collections import OrderedDict
 
 from auth.authorization import ANY_USER
+from config.exceptions import InvalidConfigException
 from model import parameter_config
-from model.model_helper import is_empty, fill_parameter_values, read_bool_from_config, InvalidValueException
+from model.model_helper import is_empty, fill_parameter_values, read_bool_from_config, InvalidValueException, \
+    read_str_from_config, replace_auth_vars
 from model.parameter_config import ParameterModel
 from react.properties import ObservableList, ObservableDict, observable_fields, Property
-from utils import file_utils
+from utils import file_utils, custom_json
 from utils.object_utils import merge_dicts
+
+OUTPUT_FORMAT_TERMINAL = 'terminal'
+
+OUTPUT_FORMATS = [OUTPUT_FORMAT_TERMINAL, 'html', 'html_iframe', 'text']
 
 LOGGER = logging.getLogger('script_server.script_config')
 
@@ -19,6 +25,8 @@ class ShortConfig(object):
     def __init__(self):
         self.name = None
         self.allowed_users = []
+        self.admin_users = []
+        self.group = None
 
 
 @observable_fields(
@@ -26,8 +34,9 @@ class ShortConfig(object):
     'description',
     'requires_terminal',
     'working_directory',
-    'ansi_enabled',
+    'output_format',
     'output_files',
+    'schedulable',
     '_included_config')
 class ConfigModel:
 
@@ -36,19 +45,17 @@ class ConfigModel:
                  path,
                  username,
                  audit_name,
-                 pty_enabled_default=True,
-                 ansi_enabled_default=True,
-                 parameter_values=None):
+                 pty_enabled_default=True):
         super().__init__()
 
         short_config = read_short(path, config_object)
         self.name = short_config.name
-        self._ansi_enabled_default = ansi_enabled_default
         self._pty_enabled_default = pty_enabled_default
         self._config_folder = os.path.dirname(path)
 
         self._username = username
         self._audit_name = audit_name
+        self.schedulable = False
 
         self.parameters = ObservableList()
         self.parameter_values = ObservableDict()
@@ -61,13 +68,12 @@ class ConfigModel:
 
         self._reload_config()
 
+        self.parameters.subscribe(self)
+
         self._init_parameters(username, audit_name)
 
-        if parameter_values is not None:
-            self.set_all_param_values(parameter_values)
-        else:
-            for parameter in self.parameters:
-                self.parameter_values[parameter.name] = parameter.default
+        for parameter in self.parameters:
+            self.parameter_values[parameter.name] = parameter.default
 
         self._reload_parameters({})
 
@@ -86,15 +92,24 @@ class ConfigModel:
 
         self.parameter_values[param_name] = value
 
-    def set_all_param_values(self, param_values):
+    def set_all_param_values(self, param_values, skip_invalid_parameters=False):
         original_values = dict(self.parameter_values)
         processed = {}
 
         anything_changed = True
+
+        def get_sort_key(parameter):
+            if parameter.name in self._included_config_path.required_parameters:
+                return len(parameter.get_required_parameters())
+            return 100 + len(parameter.get_required_parameters())
+
+        sorted_parameters = sorted(self.parameters, key=get_sort_key)
+
         while (len(processed) < len(self.parameters)) and anything_changed:
             anything_changed = False
 
-            for parameter in self.parameters:
+            parameters = sorted_parameters + [p for p in self.parameters if p not in sorted_parameters]
+            for parameter in parameters:
                 if parameter.name in processed:
                     continue
 
@@ -105,8 +120,12 @@ class ConfigModel:
                 value = parameter.normalize_user_value(param_values.get(parameter.name))
                 validation_error = parameter.validate_value(value)
                 if validation_error:
-                    self.parameter_values.set(original_values)
-                    raise InvalidValueException(parameter.name, validation_error)
+                    if skip_invalid_parameters:
+                        logging.warning('Parameter ' + parameter.name + ' has invalid value, skipping')
+                        value = parameter.normalize_user_value(None)
+                    else:
+                        self.parameter_values.set(original_values)
+                        raise InvalidValueException(parameter.name, validation_error)
 
                 self.parameter_values[parameter.name] = value
                 processed[parameter.name] = parameter
@@ -150,16 +169,21 @@ class ConfigModel:
             config = merge_dicts(self._original_config, self._included_config, ignored_keys=['parameters'])
 
         self.script_command = config.get('script_path')
-        self.description = config.get('description')
+        self.description = replace_auth_vars(config.get('description'), self._username, self._audit_name)
         self.working_directory = config.get('working_directory')
 
         required_terminal = read_bool_from_config('requires_terminal', config, default=self._pty_enabled_default)
         self.requires_terminal = required_terminal
 
-        ansi_enabled = read_bool_from_config('bash_formatting', config, default=self._ansi_enabled_default)
-        self.ansi_enabled = ansi_enabled
+        self.output_format = read_output_format(config)
 
         self.output_files = config.get('output_files', [])
+
+        if config.get('scheduling'):
+            self.schedulable = read_bool_from_config('enabled', config.get('scheduling'), default=False)
+
+        if not self.script_command:
+            raise Exception('No script_path is specified for ' + self.name)
 
     def _reload_parameters(self, old_included_config):
         original_parameters_names = {p.get('name') for p in self._original_config.get('parameters', [])}
@@ -199,6 +223,15 @@ class ConfigModel:
                 return parameter
         return None
 
+    def on_add(self, parameter, index):
+        if self.schedulable and parameter.secure:
+            LOGGER.warning(
+                'Disabling schedulable functionality, because parameter ' + parameter.str_name() + ' is secure')
+            self.schedulable = False
+
+    def on_remove(self, parameter):
+        pass
+
     def _validate_parameter_configs(self):
         for parameter in self.parameters:
             parameter.validate_parameter_dependencies(self.parameters)
@@ -212,7 +245,7 @@ class ConfigModel:
         if os.path.exists(path):
             try:
                 file_content = file_utils.read_file(path)
-                return json.loads(file_content)
+                return custom_json.loads(file_content)
             except:
                 LOGGER.exception('Failed to load included file ' + path)
                 return None
@@ -235,6 +268,8 @@ def read_short(file_path, json_object):
 
     config.name = _read_name(file_path, json_object)
     config.allowed_users = json_object.get('allowed_users')
+    config.admin_users = json_object.get('admin_users')
+    config.group = read_str_from_config(json_object, 'group', blank_to_none=True)
 
     hidden = read_bool_from_config('hidden', json_object, default=False)
     if hidden:
@@ -244,6 +279,11 @@ def read_short(file_path, json_object):
         config.allowed_users = ANY_USER
     elif (config.allowed_users == '*') or ('*' in config.allowed_users):
         config.allowed_users = ANY_USER
+
+    if config.admin_users is None:
+        config.admin_users = ANY_USER
+    elif (config.admin_users == '*') or ('*' in config.admin_users):
+        config.admin_users = ANY_USER
 
     return config
 
@@ -330,8 +370,19 @@ class _TemplateProperty:
 
 
 def get_sorted_config(config):
-    key_order = ['name', 'script_path', 'working_directory', 'hidden', 'description', 'allowed_users', 'include',
-                 'output_files', 'requires_terminal', 'bash_formatting', 'parameters']
+    key_order = ['name', 'script_path',
+                 'working_directory',
+                 'hidden',
+                 'description',
+                 'group',
+                 'allowed_users',
+                 'admin_users',
+                 'schedulable',
+                 'include',
+                 'output_files',
+                 'requires_terminal',
+                 'output_format',
+                 'parameters']
 
     def get_order(key):
         if key == 'parameters':
@@ -347,3 +398,15 @@ def get_sorted_config(config):
             config['parameters'][i] = parameter_config.get_sorted_config(param)
 
     return sorted_config
+
+
+def read_output_format(config):
+    output_format = config.get('output_format')
+    if not output_format:
+        output_format = OUTPUT_FORMAT_TERMINAL
+
+    output_format = output_format.strip().lower()
+    if output_format not in OUTPUT_FORMATS:
+        raise InvalidConfigException('Invalid output format, should be one of: ' + str(OUTPUT_FORMATS))
+
+    return output_format

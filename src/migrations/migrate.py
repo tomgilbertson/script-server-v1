@@ -8,9 +8,11 @@ from datetime import datetime
 
 import execution.logging
 from execution.logging import ExecutionLoggingService
+from model import model_helper
 from utils import file_utils
 from utils.date_utils import sec_to_datetime, to_millis
 from utils.string_utils import is_blank
+import utils.custom_json as custom_json
 
 __migrations_registry = OrderedDict()
 
@@ -206,7 +208,7 @@ def __introduce_access_config(context):
         return
 
     content = file_utils.read_file(file_path)
-    json_object = json.loads(content, object_pairs_hook=OrderedDict)
+    json_object = custom_json.loads(content, object_pairs_hook=OrderedDict)
 
     def move_to_access(field, parent_object):
         if 'access' not in json_object:
@@ -234,20 +236,8 @@ def __introduce_access_config(context):
 
 
 @_migration('migrate_output_files_parameters_substitution')
-def __introduce_access_config(context):
-    conf_folder = os.path.join(context.conf_folder, 'runners')
-
-    if not os.path.exists(conf_folder):
-        return
-
-    conf_files = [os.path.join(conf_folder, file)
-                  for file in os.listdir(conf_folder)
-                  if file.lower().endswith('.json')]
-
-    for conf_file in conf_files:
-        content = file_utils.read_file(conf_file)
-        json_object = json.loads(content, object_pairs_hook=OrderedDict)
-
+def __migrate_output_files_parameters_substitution(context):
+    for (conf_file, json_object, content) in _load_runner_files(context.conf_folder):
         if ('output_files' not in json_object) or ('parameters' not in json_object):
             continue
 
@@ -273,6 +263,64 @@ def __introduce_access_config(context):
             _write_json(conf_file, json_object, content)
 
 
+# 1.16 -> 1.17 migration
+@_migration('migrate_bash_formatting_to_output_format')
+def __migrate_bash_formatting_to_output_format(context):
+    for (conf_file, json_object, content) in _load_runner_files(context.conf_folder):
+        if 'bash_formatting' not in json_object:
+            continue
+
+        if model_helper.read_bool_from_config('bash_formatting', json_object, default=True) is False:
+            output_format = 'text'
+        else:
+            output_format = 'terminal'
+
+        del json_object['bash_formatting']
+        json_object['output_format'] = output_format
+
+        _write_json(conf_file, json_object, content)
+
+
+# 1.16 -> 1.17 migration
+@_migration('migrate_repeat_param_and_same_arg_param')
+def __migrate_repeat_param_and_same_arg_param(context):
+    for (conf_file, json_object, content) in _load_runner_files(context.conf_folder):
+        parameters = json_object.get('parameters')
+        if not parameters:
+            continue
+
+        has_changes = False
+        for parameter in parameters:
+            repeat_param = model_helper.read_bool_from_config('repeat_param', parameter)
+            same_arg_param = model_helper.read_bool_from_config('same_arg_param', parameter)
+            multiple_arguments = model_helper.read_bool_from_config('multiple_arguments', parameter)
+
+            if repeat_param is None and same_arg_param is None and multiple_arguments is None:
+                continue
+
+            has_changes = True
+
+            if repeat_param is not None:
+                del parameter['repeat_param']
+
+            if same_arg_param is not None:
+                del parameter['same_arg_param']
+
+            if multiple_arguments is not None:
+                del parameter['multiple_arguments']
+
+            if repeat_param is not None:
+                parameter['same_arg_param'] = not repeat_param
+
+            if same_arg_param:
+                parameter['multiselect_argument_type'] = 'repeat_param_value'
+            elif multiple_arguments:
+                parameter['multiselect_argument_type'] = 'argument_per_value'
+
+        if has_changes:
+            _write_json(conf_file, json_object, content)
+
+
 def _write_json(file_path, json_object, old_content):
     space_matches = re.findall('^\s+', old_content, flags=re.MULTILINE)
     if space_matches:
@@ -282,6 +330,30 @@ def _write_json(file_path, json_object, old_content):
         indent = 4
     with open(file_path, 'w') as fp:
         json.dump(json_object, fp, indent=indent)
+
+
+def _load_runner_files(conf_folder):
+    runners_folder = os.path.join(conf_folder, 'runners')
+
+    if not os.path.exists(runners_folder):
+        return
+
+    conf_files = [os.path.join(runners_folder, file)
+                  for file in os.listdir(runners_folder)
+                  if file.lower().endswith('.json')]
+
+    result = []
+
+    for conf_file in conf_files:
+        content = file_utils.read_file(conf_file)
+        try:
+            json_object = custom_json.loads(content, object_pairs_hook=OrderedDict)
+            result.append((conf_file, json_object, content))
+        except Exception:
+            LOGGER.exception('Failed to load file for migration: ' + conf_file)
+            continue
+
+    return result
 
 
 def migrate(temp_folder, conf_folder, conf_file, log_folder):

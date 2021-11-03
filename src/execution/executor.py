@@ -210,22 +210,49 @@ def build_command_args(param_values, config):
 
     for parameter in config.parameters:
         name = parameter.name
+        option_name = parameter.param
 
         if name in param_values:
             value = param_values[name]
 
             if parameter.no_value:
-                if value is True:
-                    result.append(parameter.param)
+                if value is True and option_name:
+                    result.append(option_name)
 
             elif value:
-                if parameter.param:
-                    result.append(parameter.param)
 
-                if isinstance(value, list):
-                    result.extend(value)
+                if option_name:
+                    if isinstance(value, list):
+                        if len(value) == 0:
+                            continue
+
+                        if parameter.multiselect_argument_type == 'argument_per_value':
+                            if parameter.same_arg_param:
+                                result.append(option_name + str(value[0]))
+                                result.extend(value[1:])
+                            else:
+                                result.append(option_name)
+                                result.extend(value)
+                        elif parameter.multiselect_argument_type == 'repeat_param_value':
+                            if parameter.same_arg_param:
+                                for el in value:
+                                    result.append(option_name + str(el))
+                            else:
+                                for el in value:
+                                    result.append(option_name)
+                                    result.append(el)
+                    else:
+                        if parameter.same_arg_param:
+                            result.append(option_name + str(value))
+                        else:
+                            result.append(option_name)
+                            result.append(value)
+
                 else:
-                    result.append(value)
+                    if isinstance(value, list):
+                        result.extend(value)
+                    else:
+                        result.append(value)
 
     return result
 
